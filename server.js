@@ -87,12 +87,12 @@ function connect() {
     state.status = "CONNECTED";
     state.connected_at = new Date().toISOString();
 
-    // Inscreve no fluxo contínuo de ticks dos 6 pares
+    // Inscreve no fluxo CONTÍNUO de cotações em tempo real (subscribe: 1)
     SYMBOLS.forEach((sym) => {
-      ws.send(JSON.stringify({ ticks: sym }));
+      ws.send(JSON.stringify({ ticks: sym, subscribe: 1 }));
     });
 
-    // Pede os payouts logo na conexão e depois a cada 5 minutos
+    // Pede os payouts logo na conexão e renova a cada 5 minutos
     queryPayouts();
     payoutTimer = setInterval(queryPayouts, 5 * 60 * 1000);
 
@@ -108,7 +108,7 @@ function connect() {
     try {
       const msg = JSON.parse(raw.toString());
 
-      // Cotação em tempo real (tick)
+      // Cotação em tempo real contínua (tick)
       if (msg.msg_type === "tick" && msg.tick) {
         const t = msg.tick;
         const sym = t.symbol;
