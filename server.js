@@ -1,5 +1,5 @@
-const http = require("http");
-const WebSocket = require("ws");
+import http from "http";
+import WebSocket from "ws";
 
 const PORT = process.env.PORT || 8080;
 const DERIV_WS_URL = "wss://api.derivws.com/trading/v1/options/ws/public?app_id=1089";
@@ -96,7 +96,7 @@ function connect() {
     queryPayouts();
     payoutTimer = setInterval(queryPayouts, 5 * 60 * 1000);
 
-    // Ping a cada 30 segundos para manter a conexão aberta 24/7
+    // Ping a cada 30 segundos para manter a conexão viva 24/7
     pingTimer = setInterval(() => {
       if (ws && ws.readyState === WebSocket.OPEN) {
         ws.send(JSON.stringify({ ping: 1 }));
@@ -130,7 +130,6 @@ function connect() {
         const ask = Number(msg.proposal.ask_price);
         const payout = Number(msg.proposal.payout);
         if (state.quotes[sym] && ask > 0 && payout > ask) {
-          // Calcula a porcentagem líquida do payout (ex: 85.5%)
           const netRate = Math.round(((payout - ask) / ask) * 1000) / 10;
           state.quotes[sym].payout = netRate;
           state.last_payout_at = new Date().toISOString();
