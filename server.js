@@ -87,14 +87,14 @@ function connect() {
     state.status = "CONNECTED";
     state.connected_at = new Date().toISOString();
 
-    // Inscreve no fluxo CONTÍNUO de cotações em tempo real (subscribe: 1)
+    // Inscreve no fluxo contínuo de cotações em tempo real
     SYMBOLS.forEach((sym) => {
       ws.send(JSON.stringify({ ticks: sym, subscribe: 1 }));
     });
 
-    // Pede os payouts logo na conexão e renova a cada 5 minutos
+    // Pede os payouts logo na conexão e renova a cada 1 minuto (60 segundos)
     queryPayouts();
-    payoutTimer = setInterval(queryPayouts, 5 * 60 * 1000);
+    payoutTimer = setInterval(queryPayouts, 60 * 1000);
 
     // Ping a cada 30 segundos para manter a conexão viva 24/7
     pingTimer = setInterval(() => {
