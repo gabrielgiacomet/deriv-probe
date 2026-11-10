@@ -14,9 +14,9 @@ const SYMBOLS = [
   'frxEURGBP'
 ];
 
-// App ID público oficial da Deriv para consultas públicas
+// Endpoint oficial de nova geração da Deriv (Trading v1)
 const DERIV_APP_ID = process.env.DERIV_APP_ID || '1089';
-const WS_URL = `wss://ws.derivws.com/websockets/v3?app_id=${DERIV_APP_ID}`;
+const WS_URL = `wss://api.derivws.com/trading/v1/options/ws/public?app_id=${DERIV_APP_ID}`;
 
 // Estado da conexão em memória
 const state = {
@@ -41,14 +41,14 @@ function connect() {
   ws.on('open', () => {
     state.status = 'CONNECTED';
     state.connected_at = new Date().toISOString();
-    console.log('[DERIV-PROBE] Conexão WebSocket estabelecida com sucesso!');
+    console.log('[DERIV-PROBE] Conexao WebSocket estabelecida com sucesso!');
 
-    // Inscreve nos 6 pares simultaneamente em uma única ligação
+    // Inscreve nos 6 pares simultaneamente em uma unica ligacao
     for (const symbol of SYMBOLS) {
       ws.send(JSON.stringify({ ticks: symbol, subscribe: 1 }));
     }
 
-    // Ping a cada 30 segundos para manter a conexão viva 24/7
+    // Ping a cada 30 segundos para manter a conexao viva 24/7
     if (pingInterval) clearInterval(pingInterval);
     pingInterval = setInterval(() => {
       if (ws && ws.readyState === WebSocket.OPEN) {
@@ -66,6 +66,8 @@ function connect() {
         state.total_ticks_received++;
         state.quotes[msg.tick.symbol] = {
           quote: msg.tick.quote,
+          ask: msg.tick.ask,
+          bid: msg.tick.bid,
           epoch: msg.tick.epoch,
           updated_at: new Date().toISOString()
         };
@@ -82,7 +84,7 @@ function connect() {
     state.status = 'DISCONNECTED';
     state.reconnect_count++;
     if (pingInterval) clearInterval(pingInterval);
-    console.warn(`[DERIV-PROBE] Conexão fechada (${code}). Reconectando em 5 segundos...`);
+    console.warn(`[DERIV-PROBE] Conexao fechada (${code}). Reconectando em 5 segundos...`);
     setTimeout(connect, 5000);
   });
 
@@ -92,10 +94,10 @@ function connect() {
   });
 }
 
-// Inicia a conexão contínua
+// Inicia a conexao continua
 connect();
 
-// Servidor HTTP simples para checagem de saúde e diagnóstico (bancada isolada)
+// Servidor HTTP simples para checagem de saude e diagnostico da bancada isolada
 const server = http.createServer((req, res) => {
   res.setHeader('Content-Type', 'application/json');
   res.setHeader('Access-Control-Allow-Origin', '*');
@@ -121,5 +123,5 @@ const server = http.createServer((req, res) => {
 });
 
 server.listen(PORT, () => {
-  console.log(`[DERIV-PROBE] Servidor de diagnóstico rodando na porta ${PORT}`);
+  console.log(`[DERIV-PROBE] Servidor de diagnostico rodando na porta ${PORT}`);
 });
