@@ -1,127 +1,181 @@
-import WebSocket from 'ws';
-import http from 'http';
+const http = require("http");
+const WebSocket = require("ws");
 
-// Porta que a Railway fornece para o serviço
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 8080;
+const DERIV_WS_URL = "wss://api.derivws.com/trading/v1/options/ws/public?app_id=1089";
 
-// Os 6 pares de moedas monitorados pela Capital Trading
 const SYMBOLS = [
-  'frxEURUSD',
-  'frxGBPUSD',
-  'frxUSDJPY',
-  'frxAUDUSD',
-  'frxUSDCAD',
-  'frxEURGBP'
+  "frxEURUSD",
+  "frxGBPUSD",
+  "frxUSDJPY",
+  "frxAUDUSD",
+  "frxUSDCAD",
+  "frxEURGBP"
 ];
 
-// Endpoint oficial de nova geração da Deriv (Trading v1)
-const DERIV_APP_ID = process.env.DERIV_APP_ID || '1089';
-const WS_URL = `wss://api.derivws.com/trading/v1/options/ws/public?app_id=${DERIV_APP_ID}`;
-
-// Estado da conexão em memória
 const state = {
-  status: 'DISCONNECTED',
+  service: "deriv-probe-isolated",
+  status: "STARTING",
+  uptime_seconds: 0,
   connected_at: null,
   last_tick_at: null,
+  last_payout_at: null,
   total_ticks_received: 0,
   errors_count: 0,
   reconnect_count: 0,
+  active_symbols_count: 0,
   quotes: {}
 };
 
+SYMBOLS.forEach((sym) => {
+  state.quotes[sym] = {
+    quote: null,
+    ask: null,
+    bid: null,
+    payout: null,
+    epoch: null,
+    updated_at: null
+  };
+});
+
+const startTime = Date.now();
+setInterval(() => {
+  state.uptime_seconds = Math.floor((Date.now() - startTime) / 1000);
+}, 1000);
+
 let ws = null;
-let pingInterval = null;
+let reconnectTimer = null;
+let pingTimer = null;
+let payoutTimer = null;
+
+function queryPayouts() {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  SYMBOLS.forEach((sym, idx) => {
+    try {
+      ws.send(JSON.stringify({
+        proposal: 1,
+        amount: 10,
+        basis: "stake",
+        contract_type: "CALL",
+        currency: "USD",
+        duration: 15,
+        duration_unit: "m",
+        underlying_symbol: sym,
+        req_id: 1000 + idx
+      }));
+    } catch (_) {}
+  });
+}
 
 function connect() {
-  state.status = 'CONNECTING';
-  console.log(`[DERIV-PROBE] Conectando a ${WS_URL}...`);
+  if (reconnectTimer) clearTimeout(reconnectTimer);
+  if (pingTimer) clearInterval(pingTimer);
+  if (payoutTimer) clearInterval(payoutTimer);
 
-  ws = new WebSocket(WS_URL);
+  state.status = "CONNECTING";
 
-  ws.on('open', () => {
-    state.status = 'CONNECTED';
+  try {
+    ws = new WebSocket(DERIV_WS_URL);
+  } catch (err) {
+    state.status = "ERROR";
+    state.errors_count++;
+    scheduleReconnect();
+    return;
+  }
+
+  ws.on("open", () => {
+    state.status = "CONNECTED";
     state.connected_at = new Date().toISOString();
-    console.log('[DERIV-PROBE] Conexao WebSocket estabelecida com sucesso!');
 
-    // Inscreve nos 6 pares simultaneamente em uma unica ligacao
-    for (const symbol of SYMBOLS) {
-      ws.send(JSON.stringify({ ticks: symbol, subscribe: 1 }));
-    }
+    // Inscreve no fluxo contínuo de ticks dos 6 pares
+    SYMBOLS.forEach((sym) => {
+      ws.send(JSON.stringify({ ticks: sym }));
+    });
 
-    // Ping a cada 30 segundos para manter a conexao viva 24/7
-    if (pingInterval) clearInterval(pingInterval);
-    pingInterval = setInterval(() => {
+    // Pede os payouts logo na conexão e depois a cada 5 minutos
+    queryPayouts();
+    payoutTimer = setInterval(queryPayouts, 5 * 60 * 1000);
+
+    // Ping a cada 30 segundos para manter a conexão aberta 24/7
+    pingTimer = setInterval(() => {
       if (ws && ws.readyState === WebSocket.OPEN) {
         ws.send(JSON.stringify({ ping: 1 }));
       }
     }, 30000);
   });
 
-  ws.on('message', (data) => {
+  ws.on("message", (raw) => {
     try {
-      const msg = JSON.parse(data.toString());
+      const msg = JSON.parse(raw.toString());
 
-      if (msg.msg_type === 'tick' && msg.tick) {
+      // Cotação em tempo real (tick)
+      if (msg.msg_type === "tick" && msg.tick) {
+        const t = msg.tick;
+        const sym = t.symbol;
+        if (state.quotes[sym]) {
+          state.quotes[sym].quote = t.quote;
+          state.quotes[sym].ask = t.ask;
+          state.quotes[sym].bid = t.bid;
+          state.quotes[sym].epoch = t.epoch;
+          state.quotes[sym].updated_at = new Date().toISOString();
+        }
         state.last_tick_at = new Date().toISOString();
         state.total_ticks_received++;
-        state.quotes[msg.tick.symbol] = {
-          quote: msg.tick.quote,
-          ask: msg.tick.ask,
-          bid: msg.tick.bid,
-          epoch: msg.tick.epoch,
-          updated_at: new Date().toISOString()
-        };
-      } else if (msg.error) {
-        state.errors_count++;
-        console.error('[DERIV-PROBE] Erro retornado pela Deriv:', msg.error);
+        state.active_symbols_count = Object.values(state.quotes).filter((q) => q.quote !== null).length;
+      }
+
+      // Resposta do Payout (proposal)
+      if (msg.msg_type === "proposal" && msg.proposal && msg.echo_req) {
+        const sym = msg.echo_req.underlying_symbol;
+        const ask = Number(msg.proposal.ask_price);
+        const payout = Number(msg.proposal.payout);
+        if (state.quotes[sym] && ask > 0 && payout > ask) {
+          // Calcula a porcentagem líquida do payout (ex: 85.5%)
+          const netRate = Math.round(((payout - ask) / ask) * 1000) / 10;
+          state.quotes[sym].payout = netRate;
+          state.last_payout_at = new Date().toISOString();
+        }
       }
     } catch (err) {
-      console.error('[DERIV-PROBE] Falha no parse:', err.message);
+      state.errors_count++;
     }
   });
 
-  ws.on('close', (code, reason) => {
-    state.status = 'DISCONNECTED';
-    state.reconnect_count++;
-    if (pingInterval) clearInterval(pingInterval);
-    console.warn(`[DERIV-PROBE] Conexao fechada (${code}). Reconectando em 5 segundos...`);
-    setTimeout(connect, 5000);
+  ws.on("error", () => {
+    state.errors_count++;
   });
 
-  ws.on('error', (err) => {
-    state.errors_count++;
-    console.error('[DERIV-PROBE] Erro no WebSocket:', err.message);
+  ws.on("close", () => {
+    state.status = "DISCONNECTED";
+    state.reconnect_count++;
+    scheduleReconnect();
   });
 }
 
-// Inicia a conexao continua
+function scheduleReconnect() {
+  if (reconnectTimer) clearTimeout(reconnectTimer);
+  if (pingTimer) clearInterval(pingTimer);
+  if (payoutTimer) clearInterval(payoutTimer);
+  reconnectTimer = setTimeout(() => {
+    connect();
+  }, 5000);
+}
+
 connect();
 
-// Servidor HTTP simples para checagem de saude e diagnostico da bancada isolada
 const server = http.createServer((req, res) => {
-  res.setHeader('Content-Type', 'application/json');
-  res.setHeader('Access-Control-Allow-Origin', '*');
-
-  if (req.url === '/health' || req.url === '/') {
-    res.writeHead(200);
-    res.end(JSON.stringify({
-      service: 'deriv-probe-isolated',
-      status: state.status,
-      uptime_seconds: Math.floor(process.uptime()),
-      connected_at: state.connected_at,
-      last_tick_at: state.last_tick_at,
-      total_ticks_received: state.total_ticks_received,
-      errors_count: state.errors_count,
-      reconnect_count: state.reconnect_count,
-      active_symbols_count: Object.keys(state.quotes).length,
-      quotes: state.quotes
-    }, null, 2));
-  } else {
-    res.writeHead(404);
-    res.end(JSON.stringify({ error: 'Not found' }));
+  if (req.url === "/health" || req.url === "/") {
+    res.writeHead(200, {
+      "Content-Type": "application/json",
+      "Access-Control-Allow-Origin": "*"
+    });
+    res.end(JSON.stringify(state, null, 2));
+    return;
   }
+  res.writeHead(404, { "Content-Type": "text/plain" });
+  res.end("Not Found");
 });
 
 server.listen(PORT, () => {
-  console.log(`[DERIV-PROBE] Servidor de diagnostico rodando na porta ${PORT}`);
+  console.log(`Deriv probe rodando na porta ${PORT}`);
 });
