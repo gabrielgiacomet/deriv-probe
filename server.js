@@ -1,180 +1,122 @@
 import http from "http";
 import WebSocket from "ws";
 
+// deriv-probe-isolated V5 — one WebSocket, fan-out to: bench (/health), Deriv Lab tick buffer (/ticks), Deriv candle history for warm-up (/candles), payouts by duration, feed gaps.
+const DERIV_WS = "wss://api.derivws.com/trading/v1/options/ws/public?app_id=1089";
+const SYMBOLS = ["frxEURUSD", "frxGBPUSD", "frxUSDJPY", "frxAUDUSD", "frxUSDCAD", "frxEURGBP"];
+const DURATIONS = [3, 5, 15]; // minutes; 3/5 = strategy expiries, 15 = bench display
+const BUFFER_SECONDS = 30 * 60;
 const PORT = process.env.PORT || 8080;
-const DERIV_WS_URL = "wss://api.derivws.com/trading/v1/options/ws/public?app_id=1089";
 
-const SYMBOLS = [
-  "frxEURUSD",
-  "frxGBPUSD",
-  "frxUSDJPY",
-  "frxAUDUSD",
-  "frxUSDCAD",
-  "frxEURGBP"
-];
-
-const state = {
-  service: "deriv-probe-isolated",
-  status: "STARTING",
-  uptime_seconds: 0,
-  connected_at: null,
-  last_tick_at: null,
-  last_payout_at: null,
-  total_ticks_received: 0,
-  errors_count: 0,
-  reconnect_count: 0,
-  active_symbols_count: 0,
-  quotes: {}
-};
-
-SYMBOLS.forEach((sym) => {
-  state.quotes[sym] = {
-    quote: null,
-    ask: null,
-    bid: null,
-    payout: null,
-    epoch: null,
-    updated_at: null
-  };
-});
-
-const startTime = Date.now();
-setInterval(() => {
-  state.uptime_seconds = Math.floor((Date.now() - startTime) / 1000);
-}, 1000);
-
-let ws = null;
-let reconnectTimer = null;
-let pingTimer = null;
-let payoutTimer = null;
-
-function queryPayouts() {
-  if (!ws || ws.readyState !== WebSocket.OPEN) return;
-  SYMBOLS.forEach((sym, idx) => {
-    try {
-      ws.send(JSON.stringify({
-        proposal: 1,
-        amount: 10,
-        basis: "stake",
-        contract_type: "CALL",
-        currency: "USD",
-        duration: 15,
-        duration_unit: "m",
-        underlying_symbol: sym,
-        req_id: 1000 + idx
-      }));
-    } catch (_) {}
-  });
-}
+const state = { status: "starting", started_at: new Date().toISOString(), connected_at: null, last_tick_at: null, last_payout_at: null, total_ticks_received: 0, errors_count: 0, reconnect_count: 0 };
+const quotes = {}, payouts = {}, buffer = [], gaps = [];
+let ws = null, pingTimer = null, payoutTimer = null, reqId = 1, openGap = null;
+const pending = {};
+const hist = {}; // req_id -> resolver (ticks_history, read-only)
 
 function connect() {
-  if (reconnectTimer) clearTimeout(reconnectTimer);
-  if (pingTimer) clearInterval(pingTimer);
-  if (payoutTimer) clearInterval(payoutTimer);
-
-  state.status = "CONNECTING";
-
-  try {
-    ws = new WebSocket(DERIV_WS_URL);
-  } catch (err) {
-    state.status = "ERROR";
-    state.errors_count++;
-    scheduleReconnect();
-    return;
-  }
-
+  ws = new WebSocket(DERIV_WS);
   ws.on("open", () => {
-    state.status = "CONNECTED";
-    state.connected_at = new Date().toISOString();
-
-    // Inscreve no fluxo contínuo de cotações em tempo real
-    SYMBOLS.forEach((sym) => {
-      ws.send(JSON.stringify({ ticks: sym, subscribe: 1 }));
-    });
-
-    // Pede os payouts logo na conexão e renova a cada 1 minuto (60 segundos)
-    queryPayouts();
-    payoutTimer = setInterval(queryPayouts, 60 * 1000);
-
-    // Ping a cada 30 segundos para manter a conexão viva 24/7
-    pingTimer = setInterval(() => {
-      if (ws && ws.readyState === WebSocket.OPEN) {
-        ws.send(JSON.stringify({ ping: 1 }));
-      }
-    }, 30000);
+    state.status = "connected"; state.connected_at = new Date().toISOString();
+    if (openGap) { openGap.end = Math.floor(Date.now() / 1000); openGap.ticks_after = state.total_ticks_received; openGap = null; }
+    for (const s of SYMBOLS) ws.send(JSON.stringify({ ticks: s, subscribe: 1 }));
+    clearInterval(pingTimer); pingTimer = setInterval(() => ws.readyState === 1 && ws.send(JSON.stringify({ ping: 1 })), 30000);
+    clearInterval(payoutTimer); queryPayouts(); runProbe(); payoutTimer = setInterval(() => { queryPayouts(); runProbe(); }, 60 * 1000);
   });
-
   ws.on("message", (raw) => {
-    try {
-      const msg = JSON.parse(raw.toString());
-
-      // Cotação em tempo real contínua (tick)
-      if (msg.msg_type === "tick" && msg.tick) {
-        const t = msg.tick;
-        const sym = t.symbol;
-        if (state.quotes[sym]) {
-          state.quotes[sym].quote = t.quote;
-          state.quotes[sym].ask = t.ask;
-          state.quotes[sym].bid = t.bid;
-          state.quotes[sym].epoch = t.epoch;
-          state.quotes[sym].updated_at = new Date().toISOString();
-        }
-        state.last_tick_at = new Date().toISOString();
-        state.total_ticks_received++;
-        state.active_symbols_count = Object.values(state.quotes).filter((q) => q.quote !== null).length;
-      }
-
-      // Resposta do Payout (proposal)
-      if (msg.msg_type === "proposal" && msg.proposal && msg.echo_req) {
-        const sym = msg.echo_req.underlying_symbol;
-        const ask = Number(msg.proposal.ask_price);
-        const payout = Number(msg.proposal.payout);
-        if (state.quotes[sym] && ask > 0 && payout > ask) {
-          const netRate = Math.round(((payout - ask) / ask) * 1000) / 10;
-          state.quotes[sym].payout = netRate;
-          state.last_payout_at = new Date().toISOString();
-        }
-      }
-    } catch (err) {
-      state.errors_count++;
+    let m; try { m = JSON.parse(raw); } catch { return; }
+    if (m.req_id && probePending[m.req_id]) {
+      const q = probePending[m.req_id]; delete probePending[m.req_id];
+      const pair = q.symbol.replace("frx", "").replace(/^(...)(...)$/, "$1/$2");
+      probe[`${q.symbol}|${q.contract_type}|${q.duration}`] = { pair, contract_type: q.contract_type, duration: q.duration, duration_unit: "m", stake: 10,
+        proposal_id: m.proposal?.id ?? null, proposal: m.proposal ? { payout: m.proposal.payout, ask_price: m.proposal.ask_price } : null, error: m.error ? { code: m.error.code, message: m.error.message } : null, at: new Date().toISOString() };
+      return;
+    }
+    if (m.req_id && hist[m.req_id]) { const r = hist[m.req_id]; delete hist[m.req_id]; return r(m); }
+    if (m.error && m.msg_type === "proposal" && pending[m.req_id]) {
+      // Contract not offered (e.g. 3m/5m Forex): recorded as unavailable, not a feed error.
+      const { symbol, duration } = pending[m.req_id]; delete pending[m.req_id];
+      payouts[symbol] = payouts[symbol] || {};
+      payouts[symbol][String(duration)] = { payout: null, unavailable: m.error.message, at: new Date().toISOString() };
+      return;
+    }
+    if (m.error) { state.errors_count++; return; }
+    if (m.msg_type === "tick" && m.tick) {
+      const t = m.tick;
+      const q = { quote: t.quote, ask: t.ask, bid: t.bid, epoch: t.epoch, updated_at: new Date(t.epoch * 1000).toISOString(), payout: payouts[t.symbol]?.["15"]?.payout ?? null };
+      quotes[t.symbol] = q;
+      buffer.push({ symbol: t.symbol, epoch: t.epoch, quote: t.quote, bid: t.bid, ask: t.ask });
+      const cut = Math.floor(Date.now() / 1000) - BUFFER_SECONDS;
+      while (buffer.length && buffer[0].epoch < cut) buffer.shift();
+      state.total_ticks_received++; state.last_tick_at = q.updated_at;
+    }
+    if (m.msg_type === "proposal" && pending[m.req_id]) {
+      const { symbol, duration } = pending[m.req_id]; delete pending[m.req_id];
+      const p = m.proposal; if (!p) return;
+      payouts[symbol] = payouts[symbol] || {};
+      payouts[symbol][String(duration)] = { payout: Math.round(((p.payout - p.ask_price) / p.ask_price) * 10000) / 10000, at: new Date().toISOString() };
+      state.last_payout_at = new Date().toISOString();
     }
   });
-
-  ws.on("error", () => {
-    state.errors_count++;
-  });
-
+  ws.on("error", () => { state.errors_count++; });
   ws.on("close", () => {
-    state.status = "DISCONNECTED";
-    state.reconnect_count++;
-    scheduleReconnect();
+    state.status = "disconnected"; clearInterval(pingTimer); clearInterval(payoutTimer);
+    if (!openGap) { openGap = { start: Math.floor(Date.now() / 1000), end: null, pairs: SYMBOLS, ticks_before: state.total_ticks_received }; gaps.push(openGap); if (gaps.length > 50) gaps.shift(); }
+    state.reconnect_count++; setTimeout(connect, 3000);
   });
 }
 
-function scheduleReconnect() {
-  if (reconnectTimer) clearTimeout(reconnectTimer);
-  if (pingTimer) clearInterval(pingTimer);
-  if (payoutTimer) clearInterval(payoutTimer);
-  reconnectTimer = setTimeout(() => {
-    connect();
-  }, 5000);
+// Price/payout queries only — NEVER buy/sell.
+// BINARY CONTRACT CAPABILITY PROBE — real proposals CALL/PUT × 3m/5m, raw answer kept (never buy/sell).
+const probe = {}; const probePending = {};
+function runProbe() {
+  if (!ws || ws.readyState !== 1) return;
+  for (const symbol of SYMBOLS) for (const contract_type of ["CALL", "PUT"]) for (const duration of [3, 5]) {
+    const id = reqId++; probePending[id] = { symbol, contract_type, duration };
+    ws.send(JSON.stringify({ proposal: 1, amount: 10, basis: "stake", contract_type, currency: "USD", duration, duration_unit: "m", underlying_symbol: symbol, req_id: id }));
+  }
+}
+function queryPayouts() {
+  if (!ws || ws.readyState !== 1) return;
+  for (const symbol of SYMBOLS) for (const duration of DURATIONS) {
+    const id = reqId++; pending[id] = { symbol, duration };
+    ws.send(JSON.stringify({ proposal: 1, amount: 10, basis: "stake", contract_type: "CALL", currency: "USD", duration, duration_unit: "m", underlying_symbol: symbol, req_id: id }));
+  }
 }
 
-connect();
-
-const server = http.createServer((req, res) => {
-  if (req.url === "/health" || req.url === "/") {
-    res.writeHead(200, {
-      "Content-Type": "application/json",
-      "Access-Control-Allow-Origin": "*"
-    });
-    res.end(JSON.stringify(state, null, 2));
-    return;
+// Deriv 1m candle history (ticks_history style=candles, max 1000 per call → paged backwards). Read-only, never buy/sell.
+function historyPage(symbol, end) {
+  return new Promise((resolve) => {
+    if (!ws || ws.readyState !== 1) return resolve([]);
+    const id = reqId++; const t = setTimeout(() => { delete hist[id]; resolve([]); }, 15000);
+    hist[id] = (m) => { clearTimeout(t); resolve(m.error ? [] : m.candles || []); };
+    ws.send(JSON.stringify({ ticks_history: symbol, style: "candles", granularity: 60, count: 1000, end, req_id: id }));
+  });
+}
+async function history(symbol, count) {
+  let out = [], end = "latest";
+  while (out.length < count) {
+    const page = await historyPage(symbol, end); if (!page.length) break;
+    out = [...page.filter((c) => !out.length || c.epoch < out[0].epoch), ...out];
+    end = page[0].epoch - 1; if (page.length < 1000) break;
   }
-  res.writeHead(404, { "Content-Type": "text/plain" });
-  res.end("Not Found");
-});
+  return out.slice(-count);
+}
 
-server.listen(PORT, () => {
-  console.log(`Deriv probe rodando na porta ${PORT}`);
-});
+http.createServer(async (req, res) => {
+  const u = new URL(req.url, "http://x");
+  res.setHeader("Access-Control-Allow-Origin", "*"); res.setHeader("Content-Type", "application/json");
+  if (u.pathname === "/ticks") {
+    const since = Number(u.searchParams.get("since") || 0);
+    return res.end(JSON.stringify({ ticks: buffer.filter((t) => t.epoch >= since) }));
+  }
+  if (u.pathname === "/candles") {
+    const symbol = u.searchParams.get("symbol"); const count = Math.min(5000, Number(u.searchParams.get("count") || 3000));
+    if (!SYMBOLS.includes(symbol)) { res.statusCode = 400; return res.end("{}"); }
+    return res.end(JSON.stringify({ symbol, source: "DERIV_TICKS_HISTORY", candles: await history(symbol, count) }));
+  }
+  if (u.pathname === "/health" || u.pathname === "/") {
+    return res.end(JSON.stringify({ service: "deriv-probe-isolated", version: 5, contract_probe: Object.values(probe), ...state, uptime_seconds: Math.floor(process.uptime()), active_symbols_count: Object.keys(quotes).length, quotes, payouts_by_duration: payouts, gaps, buffer_ticks: buffer.length }));
+  }
+  res.statusCode = 404; res.end("{}");
+}).listen(PORT, () => connect());
