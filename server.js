@@ -1,7 +1,7 @@
 import http from "http";
 import WebSocket from "ws";
 
-// deriv-probe-isolated V5 — one WebSocket, fan-out to: bench (/health), Deriv Lab tick buffer (/ticks), Deriv candle history for warm-up (/candles), payouts by duration, feed gaps.
+// deriv-probe-isolated V6 — adds 15m proposal feed (same WebSocket, same fan-out). V5 — one WebSocket, fan-out to: bench (/health), Deriv Lab tick buffer (/ticks), Deriv candle history for warm-up (/candles), payouts by duration, feed gaps.
 const DERIV_WS = "wss://api.derivws.com/trading/v1/options/ws/public?app_id=1089";
 const SYMBOLS = ["frxEURUSD", "frxGBPUSD", "frxUSDJPY", "frxAUDUSD", "frxUSDCAD", "frxEURGBP"];
 const DURATIONS = [3, 5, 15]; // minutes; 3/5 = strategy expiries, 15 = bench display
@@ -10,7 +10,7 @@ const PORT = process.env.PORT || 8080;
 
 const state = { status: "starting", started_at: new Date().toISOString(), connected_at: null, last_tick_at: null, last_payout_at: null, total_ticks_received: 0, errors_count: 0, reconnect_count: 0 };
 const quotes = {}, payouts = {}, buffer = [], gaps = [];
-let ws = null, pingTimer = null, payoutTimer = null, reqId = 1, openGap = null;
+let ws = null, pingTimer = null, payoutTimer = null, p15Timer = null, reqId = 1, openGap = null;
 const pending = {};
 const hist = {}; // req_id -> resolver (ticks_history, read-only)
 
@@ -21,7 +21,8 @@ function connect() {
     if (openGap) { openGap.end = Math.floor(Date.now() / 1000); openGap.ticks_after = state.total_ticks_received; openGap = null; }
     for (const s of SYMBOLS) ws.send(JSON.stringify({ ticks: s, subscribe: 1 }));
     clearInterval(pingTimer); pingTimer = setInterval(() => ws.readyState === 1 && ws.send(JSON.stringify({ ping: 1 })), 30000);
-    clearInterval(payoutTimer); queryPayouts(); runProbe(); payoutTimer = setInterval(() => { queryPayouts(); runProbe(); }, 60 * 1000);
+    clearInterval(payoutTimer); queryPayouts(); runProbe(); payoutTimer = setInterval(() => { queryPayouts(); runProbe(); checkContracts(); }, 60 * 1000);
+    clearInterval(p15Timer); checkContracts(); runProbe15(); p15Timer = setInterval(runProbe15, 15 * 1000);
   });
   ws.on("message", (raw) => {
     let m; try { m = JSON.parse(raw); } catch { return; }
@@ -30,6 +31,13 @@ function connect() {
       const pair = q.symbol.replace("frx", "").replace(/^(...)(...)$/, "$1/$2");
       probe[`${q.symbol}|${q.contract_type}|${q.duration}`] = { pair, contract_type: q.contract_type, duration: q.duration, duration_unit: "m", stake: 10,
         proposal_id: m.proposal?.id ?? null, proposal: m.proposal ? { payout: m.proposal.payout, ask_price: m.proposal.ask_price } : null, error: m.error ? { code: m.error.code, message: m.error.message } : null, at: new Date().toISOString() };
+      return;
+    }
+    if (m.req_id && cfPending[m.req_id]) {
+      const symbol = cfPending[m.req_id]; delete cfPending[m.req_id];
+      const list = m.contracts_for?.available || [];
+      const has = (ct) => list.some((c) => c.contract_type === ct && (c.expiry_type === "intraday" || c.expiry_type === "daily") && minDur(c.min_contract_duration) <= 15 && maxDur(c.max_contract_duration) >= 15);
+      avail15[symbol] = { CALL: has("CALL"), PUT: has("PUT"), error: m.error ? m.error.message : null, at: new Date().toISOString() };
       return;
     }
     if (m.req_id && hist[m.req_id]) { const r = hist[m.req_id]; delete hist[m.req_id]; return r(m); }
@@ -60,7 +68,7 @@ function connect() {
   });
   ws.on("error", () => { state.errors_count++; });
   ws.on("close", () => {
-    state.status = "disconnected"; clearInterval(pingTimer); clearInterval(payoutTimer);
+    state.status = "disconnected"; clearInterval(pingTimer); clearInterval(payoutTimer); clearInterval(p15Timer);
     if (!openGap) { openGap = { start: Math.floor(Date.now() / 1000), end: null, pairs: SYMBOLS, ticks_before: state.total_ticks_received }; gaps.push(openGap); if (gaps.length > 50) gaps.shift(); }
     state.reconnect_count++; setTimeout(connect, 3000);
   });
@@ -75,6 +83,32 @@ function runProbe() {
     const id = reqId++; probePending[id] = { symbol, contract_type, duration };
     ws.send(JSON.stringify({ proposal: 1, amount: 10, basis: "stake", contract_type, currency: "USD", duration, duration_unit: "m", underlying_symbol: symbol, req_id: id }));
   }
+}
+// 15M PROPOSAL FEED — availability first (contracts_for), then real CALL/PUT 15m proposals every 15s. Never buy/sell.
+const avail15 = {}; const cfPending = {};
+const toMin = (d) => { const m = /^(\d+)([smhd])$/.exec(String(d || "")); if (!m) return null; return Number(m[1]) * ({ s: 1 / 60, m: 1, h: 60, d: 1440 })[m[2]]; };
+const minDur = (d) => toMin(d) ?? Infinity, maxDur = (d) => toMin(d) ?? -Infinity;
+function checkContracts() {
+  if (!ws || ws.readyState !== 1) return;
+  for (const symbol of SYMBOLS) { const id = reqId++; cfPending[id] = symbol; ws.send(JSON.stringify({ contracts_for: symbol, currency: "USD", req_id: id })); }
+}
+function runProbe15() {
+  if (!ws || ws.readyState !== 1) return;
+  for (const symbol of SYMBOLS) for (const contract_type of ["CALL", "PUT"]) {
+    if (avail15[symbol] && avail15[symbol][contract_type] === false && !avail15[symbol].error) continue; // not offered → don't spam
+    const id = reqId++; probePending[id] = { symbol, contract_type, duration: 15 };
+    ws.send(JSON.stringify({ proposal: 1, amount: 10, basis: "stake", contract_type, currency: "USD", duration: 15, duration_unit: "m", underlying_symbol: symbol, req_id: id }));
+  }
+}
+function feed15() {
+  const rows = Object.values(probe).filter((p) => p.duration === 15);
+  const ok = rows.filter((p) => p.proposal && !p.error);
+  const last = ok.map((p) => p.at).sort().pop() || null;
+  return { status: state.status === "connected" ? "CONNECTED" : "DISCONNECTED", pairs_available: new Set(ok.map((p) => p.pair)).size,
+    contracts_available: ok.length, availability: avail15, last_proposal_timestamp: last, proposal_age_s: last ? Math.round((Date.now() - Date.parse(last)) / 1000) : null,
+    errors: rows.filter((p) => p.error).map((p) => ({ pair: p.pair, contract_type: p.contract_type, error: p.error })), reconnections: state.reconnect_count,
+    proposals: ok.map((p) => ({ pair: p.pair, contract_type: p.contract_type, duration: 15, ask_price: p.proposal.ask_price, payout: p.proposal.payout,
+      potential_return: Math.round(((p.proposal.payout - p.proposal.ask_price) / p.proposal.ask_price) * 10000) / 10000, at: p.at })) };
 }
 function queryPayouts() {
   if (!ws || ws.readyState !== 1) return;
@@ -116,7 +150,7 @@ http.createServer(async (req, res) => {
     return res.end(JSON.stringify({ symbol, source: "DERIV_TICKS_HISTORY", candles: await history(symbol, count) }));
   }
   if (u.pathname === "/health" || u.pathname === "/") {
-    return res.end(JSON.stringify({ service: "deriv-probe-isolated", version: 5, contract_probe: Object.values(probe), ...state, uptime_seconds: Math.floor(process.uptime()), active_symbols_count: Object.keys(quotes).length, quotes, payouts_by_duration: payouts, gaps, buffer_ticks: buffer.length }));
+    return res.end(JSON.stringify({ service: "deriv-probe-isolated", version: 6, deriv_15m_proposal_feed: feed15(), contract_probe: Object.values(probe), ...state, uptime_seconds: Math.floor(process.uptime()), active_symbols_count: Object.keys(quotes).length, quotes, payouts_by_duration: payouts, gaps, buffer_ticks: buffer.length }));
   }
   res.statusCode = 404; res.end("{}");
 }).listen(PORT, () => connect());
