@@ -1,7 +1,7 @@
 import http from "http";
 import WebSocket from "ws";
 
-// deriv-probe-isolated V6 — adds 15m proposal feed (same WebSocket, same fan-out). V5 — one WebSocket, fan-out to: bench (/health), Deriv Lab tick buffer (/ticks), Deriv candle history for warm-up (/candles), payouts by duration, feed gaps.
+// deriv-probe-isolated V7 — 15m feed queued (150ms between proposals, RateLimit backoff 1s/2s, max 2 retries). V6 — adds 15m proposal feed (same WebSocket, same fan-out). V5 — one WebSocket, fan-out to: bench (/health), Deriv Lab tick buffer (/ticks), Deriv candle history for warm-up (/candles), payouts by duration, feed gaps.
 const DERIV_WS = "wss://api.derivws.com/trading/v1/options/ws/public?app_id=1089";
 const SYMBOLS = ["frxEURUSD", "frxGBPUSD", "frxUSDJPY", "frxAUDUSD", "frxUSDCAD", "frxEURGBP"];
 const DURATIONS = [3, 5, 15]; // minutes; 3/5 = strategy expiries, 15 = bench display
@@ -31,6 +31,7 @@ function connect() {
       const pair = q.symbol.replace("frx", "").replace(/^(...)(...)$/, "$1/$2");
       probe[`${q.symbol}|${q.contract_type}|${q.duration}`] = { pair, contract_type: q.contract_type, duration: q.duration, duration_unit: "m", stake: 10,
         proposal_id: m.proposal?.id ?? null, proposal: m.proposal ? { payout: m.proposal.payout, ask_price: m.proposal.ask_price } : null, error: m.error ? { code: m.error.code, message: m.error.message } : null, at: new Date().toISOString() };
+      if (q.done) q.done(m);
       return;
     }
     if (m.req_id && cfPending[m.req_id]) {
@@ -92,13 +93,34 @@ function checkContracts() {
   if (!ws || ws.readyState !== 1) return;
   for (const symbol of SYMBOLS) { const id = reqId++; cfPending[id] = symbol; ws.send(JSON.stringify({ contracts_for: symbol, currency: "USD", req_id: id })); }
 }
-function runProbe15() {
-  if (!ws || ws.readyState !== 1) return;
-  for (const symbol of SYMBOLS) for (const contract_type of ["CALL", "PUT"]) {
-    if (avail15[symbol] && avail15[symbol][contract_type] === false && !avail15[symbol].error) continue; // not offered → don't spam
-    const id = reqId++; probePending[id] = { symbol, contract_type, duration: 15 };
+const GAP_MS = 150; const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const isRL = (e) => e && (e.code === "RateLimit" || /rate ?limit/i.test(e.message || ""));
+let q15Busy = false; const q15Stats = { rate_limit_total: 0, retries_total: 0, failed_after_retries: 0, last_cycle_ms: null, gaps_ms: [] };
+function ask15(symbol, contract_type) {
+  return new Promise((resolve) => {
+    if (!ws || ws.readyState !== 1) return resolve(null);
+    const id = reqId++; const t = setTimeout(() => { delete probePending[id]; resolve(null); }, 5000);
+    probePending[id] = { symbol, contract_type, duration: 15, done: (m) => { clearTimeout(t); resolve(m); } };
     ws.send(JSON.stringify({ proposal: 1, amount: 10, basis: "stake", contract_type, currency: "USD", duration: 15, duration_unit: "m", underlying_symbol: symbol, req_id: id }));
-  }
+  });
+}
+async function runProbe15() {
+  if (!ws || ws.readyState !== 1 || q15Busy) return;
+  q15Busy = true; const t0 = Date.now(); let lastSend = 0; const gapsSeen = [];
+  try {
+    for (const symbol of SYMBOLS) for (const contract_type of ["CALL", "PUT"]) {
+      if (avail15[symbol] && avail15[symbol][contract_type] === false && !avail15[symbol].error) continue;
+      for (let attempt = 0; attempt <= 2; attempt++) {
+        const wait = lastSend ? GAP_MS - (Date.now() - lastSend) : 0; if (wait > 0) await sleep(wait);
+        if (lastSend) gapsSeen.push(Date.now() - lastSend); lastSend = Date.now();
+        const m = await ask15(symbol, contract_type);
+        if (!m || !isRL(m.error)) break;
+        q15Stats.rate_limit_total++;
+        if (attempt === 2) { q15Stats.failed_after_retries++; break; } // stays as error; next 15s cycle retries; never reuse stale
+        q15Stats.retries_total++; await sleep(attempt === 0 ? 1000 : 2000);
+      }
+    }
+  } finally { q15Stats.last_cycle_ms = Date.now() - t0; q15Stats.gaps_ms = gapsSeen; q15Busy = false; }
 }
 function feed15() {
   const rows = Object.values(probe).filter((p) => p.duration === 15);
@@ -106,6 +128,7 @@ function feed15() {
   const last = ok.map((p) => p.at).sort().pop() || null;
   return { status: state.status === "connected" ? "CONNECTED" : "DISCONNECTED", pairs_available: new Set(ok.map((p) => p.pair)).size,
     contracts_available: ok.length, availability: avail15, last_proposal_timestamp: last, proposal_age_s: last ? Math.round((Date.now() - Date.parse(last)) / 1000) : null,
+    queue: { interval_ms: GAP_MS, cycle_s: 15, ...q15Stats, min_gap_ms: q15Stats.gaps_ms.length ? Math.min(...q15Stats.gaps_ms) : null },
     errors: rows.filter((p) => p.error).map((p) => ({ pair: p.pair, contract_type: p.contract_type, error: p.error })), reconnections: state.reconnect_count,
     proposals: ok.map((p) => ({ pair: p.pair, contract_type: p.contract_type, duration: 15, ask_price: p.proposal.ask_price, payout: p.proposal.payout,
       potential_return: Math.round(((p.proposal.payout - p.proposal.ask_price) / p.proposal.ask_price) * 10000) / 10000, at: p.at })) };
@@ -150,7 +173,7 @@ http.createServer(async (req, res) => {
     return res.end(JSON.stringify({ symbol, source: "DERIV_TICKS_HISTORY", candles: await history(symbol, count) }));
   }
   if (u.pathname === "/health" || u.pathname === "/") {
-    return res.end(JSON.stringify({ service: "deriv-probe-isolated", version: 6, deriv_15m_proposal_feed: feed15(), contract_probe: Object.values(probe), ...state, uptime_seconds: Math.floor(process.uptime()), active_symbols_count: Object.keys(quotes).length, quotes, payouts_by_duration: payouts, gaps, buffer_ticks: buffer.length }));
+    return res.end(JSON.stringify({ service: "deriv-probe-isolated", version: 7, deriv_15m_proposal_feed: feed15(), contract_probe: Object.values(probe), ...state, uptime_seconds: Math.floor(process.uptime()), active_symbols_count: Object.keys(quotes).length, quotes, payouts_by_duration: payouts, gaps, buffer_ticks: buffer.length }));
   }
   res.statusCode = 404; res.end("{}");
 }).listen(PORT, () => connect());
