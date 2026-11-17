@@ -2,6 +2,9 @@ import crypto from "crypto";
 import http from "http";
 import WebSocket from "ws";
 
+// deriv-probe-isolated V12 — surgical: paginated /stream/history (COMPLETE/PARTIAL/UNRECOVERABLE), proposal RateLimit stops full cycle, market timestamp immutable, pending proposal timeout.
+// deriv-probe-isolated V11 — DERIV_PERSISTENT_STREAMING_PHASE_B_V1: protected /stream/history (ticks_history style=ticks, gap recovery P1)
+// and /stream/proposals (stpRNG CALL/PUT 1-10 ticks on the SAME socket, req_id multiplexed). READ-ONLY, never buy/sell, OPERATIONAL_POWER = ZERO.
 // deriv-probe-isolated V8 — 3m/5m transformed into DERIV_3M5M_CAPABILITY_MONITOR (checked on startup, reconnect, and every 6h).
 // Continuous 3m/5m proposal polling eliminated while CONTRACT_AVAILABLE = false, completely stopping RateLimits.
 // 15m queued feed (150ms gap, RateLimit backoff 1s/2s, max 2 retries) preserved 100%.
@@ -43,6 +46,13 @@ const quotes = {}, payouts = {}, buffer = [], gaps = [], alerts = [];
 let ws = null, pingTimer = null, p15Timer = null, capTimer = null, reqId = 1, openGap = null;
 const pending = {};
 const hist = {}; // req_id -> resolver (ticks_history, read-only)
+// PHASE B — Step HF proposals (stpRNG) on the same persistent socket.
+const STEP_SYMBOL = "stpRNG", STEP_HORIZONS = [1, 2, 3, 5, 7, 10], STEP_STAKE = 10, PROP_GAP_MS = 250, PROP_BUFFER_S = 30 * 60;
+const stepProp = { pending: {}, buffer: [], cycle_ms: 60000, timer: null, running: false, sent: 0, ok: 0, failed: 0, rate_limited: 0, last_cycle_at: null, unavailable: {} };
+// PHASE B — gap recovery: one history request at a time, bounded window, authorized symbols only.
+const HISTORY_MAX_COUNT = 5000, HISTORY_MAX_WINDOW_S = 6 * 3600, HISTORY_MAX_PAGES = Number(process.env.HISTORY_MAX_PAGES || 30), HISTORY_PAGE_GAP_MS = 300, HISTORY_RL_BACKOFF_MS = [2000, 4000, 8000];
+const PROP_PENDING_TIMEOUT_MS = 15000; let propSeq = 0;
+let historyBusy = false; const historyStats = { requests: 0, rate_limited: 0, last_at: null };
 
 // 3M / 5M CAPABILITY MONITOR
 const capability3m = {
@@ -116,6 +126,9 @@ function connect() {
     clearInterval(p15Timer);
     runProbe15();
     p15Timer = setInterval(runProbe15, 15 * 1000);
+
+    // 5. PHASE B: Step HF proposal cycle (same socket)
+    clearTimeout(stepProp.timer); stepProp.timer = setTimeout(runStepProposals, 5000);
   });
 
   ws.on("message", (raw) => {
@@ -192,6 +205,21 @@ function connect() {
       return;
     }
 
+    // PHASE B: Step HF proposal response
+    if (m.req_id && stepProp.pending[m.req_id]) {
+      const q = stepProp.pending[m.req_id]; delete stepProp.pending[m.req_id]; clearTimeout(q.timer);
+      const now = Date.now(), rl = m.error && /rate ?limit/i.test(m.error.code + " " + m.error.message);
+      if (rl) { stepProp.rate_limited++; stepProp.cycle_limited = true; }
+      if (m.error) { stepProp.failed++; if (/duration|not offered/i.test(m.error.message)) stepProp.unavailable[q.direction + "_" + q.horizon] = m.error.message; }
+      else stepProp.ok++;
+      stepProp.buffer.push({ symbol: STEP_SYMBOL, direction: q.direction, horizon: q.horizon, stake: STEP_STAKE, ask_price: m.proposal?.ask_price ?? null, payout: m.proposal?.payout ?? null,
+        quote_timestamp: m.proposal?.spot_time != null ? new Date(m.proposal.spot_time * 1000).toISOString() : null, spot_time: m.proposal?.spot_time ?? null,
+        req_id: m.req_id, request_seq: q.seq, received_at: new Date(now).toISOString(), latency_ms: now - q.sentAt,
+        error: m.error ? m.error.message : null, connection_id: stream.conn_id });
+      const cut = Date.now() - PROP_BUFFER_S * 1000; while (stepProp.buffer.length && Date.parse(stepProp.buffer[0].received_at) < cut) stepProp.buffer.shift();
+      return;
+    }
+
     // Candle history response
     if (m.req_id && hist[m.req_id]) {
       const r = hist[m.req_id];
@@ -264,6 +292,7 @@ function connect() {
       gaps.push(openGap);
       if (gaps.length > 50) gaps.shift();
     }
+    clearTimeout(stepProp.timer); for (const k of Object.keys(stepProp.pending)) { clearTimeout(stepProp.pending[k].timer); delete stepProp.pending[k]; }
     state.reconnect_count++;
     stream.reconnects++; stream.connected_since = null;
     const wait = Math.min(backoffMs, 60000) * (0.8 + Math.random() * 0.4); backoffMs = Math.min(backoffMs * 2, 60000);
@@ -526,6 +555,69 @@ function feed15() {
   };
 }
 
+// PHASE B: Step HF proposals — 12 quotes per cycle, spaced, cycle slows on RateLimit (never a second socket).
+async function runStepProposals() {
+  if (stepProp.running) return; stepProp.running = true;
+  stepProp.cycle_limited = false;
+  try {
+    cycle: for (const direction of ["CALL", "PUT"]) for (const horizon of STEP_HORIZONS) {
+      if (!ws || ws.readyState !== 1 || stepProp.cycle_limited) break cycle; // first RateLimit stops the WHOLE cycle
+      const id = reqId++;
+      const timer = setTimeout(() => { if (stepProp.pending[id]) { delete stepProp.pending[id]; stepProp.failed++; stepProp.timeouts = (stepProp.timeouts || 0) + 1; } }, PROP_PENDING_TIMEOUT_MS);
+      stepProp.pending[id] = { direction, horizon, sentAt: Date.now(), seq: ++propSeq, timer };
+      ws.send(JSON.stringify({ proposal: 1, amount: STEP_STAKE, basis: "stake", contract_type: direction, currency: "USD", duration: horizon, duration_unit: "t", underlying_symbol: STEP_SYMBOL, req_id: id }));
+      stepProp.sent++;
+      await new Promise((r) => setTimeout(r, PROP_GAP_MS));
+      if (stepProp.cycle_limited) break cycle;
+    }
+  } finally {
+    const limited = stepProp.cycle_limited; stepProp.running = false; stepProp.last_cycle_at = new Date().toISOString();
+    stepProp.cycle_ms = limited ? Math.min(300000, stepProp.cycle_ms * 2) : 60000;
+    clearTimeout(stepProp.timer); if (ws && ws.readyState === 1) stepProp.timer = setTimeout(runStepProposals, stepProp.cycle_ms);
+  }
+}
+// PHASE B: tick history for gap recovery (style=ticks). Bounded, single-flight, authorized symbols only.
+function tickHistory(symbol, start, end) {
+  return new Promise((resolve) => {
+    if (!ws || ws.readyState !== 1) return resolve({ error: "STREAM_NOT_CONNECTED" });
+    const id = reqId++; historyStats.requests++; historyStats.last_at = new Date().toISOString();
+    const t = setTimeout(() => { delete hist[id]; resolve({ error: "TIMEOUT" }); }, 15000);
+    hist[id] = (m) => {
+      clearTimeout(t);
+      if (m.error) { if (/rate ?limit/i.test(m.error.code + " " + m.error.message)) historyStats.rate_limited++; return resolve({ error: m.error.code || m.error.message }); }
+      const p = m.history?.prices || [], ts = m.history?.times || [];
+      resolve({ ticks: ts.map((e, i) => ({ epoch: Number(e), quote: Number(p[i]) })) });
+    };
+    ws.send(JSON.stringify({ ticks_history: symbol, style: "ticks", start, end, count: HISTORY_MAX_COUNT, req_id: id }));
+  });
+}
+
+// PHASE B fix: paginated gap recovery. Deriv returns the LAST `count` ticks of [start,end], so page backwards from end; one request at a time.
+async function tickHistoryPaged(symbol, start, end) {
+  const byEpoch = new Map(); let cursor = end, pages = 0, rlTries = 0, lastErr = null, exhausted = false;
+  while (cursor >= start) {
+    if (pages >= HISTORY_MAX_PAGES) { lastErr = "MAX_PAGES_REACHED"; break; }
+    const r = await tickHistory(symbol, start, cursor); pages++;
+    if (r.error) {
+      if (/rate ?limit/i.test(r.error) && rlTries < HISTORY_RL_BACKOFF_MS.length) { await new Promise((ok) => setTimeout(ok, HISTORY_RL_BACKOFF_MS[rlTries++])); continue; }
+      lastErr = r.error; break;
+    }
+    const ticks = r.ticks.filter((t) => t.epoch >= start && t.epoch <= cursor);
+    for (const t of ticks) byEpoch.set(t.epoch, t);
+    if (!ticks.length) { exhausted = true; break; } // nothing left in [start,cursor]
+    const earliest = Math.min(...ticks.map((t) => t.epoch));
+    if (earliest <= start) { exhausted = true; break; } // range start reached
+    // Deriv caps each response (observed 1000 ticks) below HISTORY_MAX_COUNT, so never infer completeness from page size.
+    if (earliest - 1 >= cursor) { lastErr = "NO_PROGRESS"; break; } // loop guard
+    cursor = earliest - 1;
+    await new Promise((ok) => setTimeout(ok, HISTORY_PAGE_GAP_MS));
+  }
+  if (cursor < start) exhausted = true;
+  const ticks = [...byEpoch.values()].sort((a, b) => a.epoch - b.epoch);
+  const status = !ticks.length ? "UNRECOVERABLE" : exhausted && !lastErr ? "COMPLETE" : "PARTIAL";
+  return { ticks, pages, status, covered_from: ticks[0]?.epoch ?? null, covered_to: ticks.at(-1)?.epoch ?? null, ...(lastErr ? { error: lastErr } : {}) };
+}
+
 // Deriv 1m candle history (ticks_history style=candles, max 1000 per call → paged backwards). Read-only, never buy/sell.
 function historyPage(symbol, end) {
   return new Promise((resolve) => {
@@ -552,7 +644,7 @@ http.createServer(async (req, res) => {
   const u = new URL(req.url, "http://x");
   res.setHeader("Content-Type", "application/json");
   // CORS only for public read endpoints; protected endpoints are server-to-server (no CORS header).
-  if (!["/stream/ticks", "/metrics", "/ticks", "/candles"].includes(u.pathname)) res.setHeader("Access-Control-Allow-Origin", "*");
+  if (!["/stream/ticks", "/stream/history", "/stream/proposals", "/metrics", "/ticks", "/candles"].includes(u.pathname)) res.setHeader("Access-Control-Allow-Origin", "*");
 
   if (u.pathname === "/stream/ticks") {
     if (!authorized(req)) return deny(res);
@@ -560,13 +652,30 @@ http.createServer(async (req, res) => {
     res.setHeader("content-type", "application/json");
     return res.end(JSON.stringify({ source: "RAILWAY_PERSISTENT_STREAM_PHASE_A", ticks: stream.buffer.filter((t) => t.epoch >= since) }));
   }
+  if (u.pathname === "/stream/history") {
+    if (!authorized(req)) return deny(res); // auth BEFORE any Deriv request
+    const symbol = u.searchParams.get("symbol"), start = Math.floor(Number(u.searchParams.get("start"))), end = Math.floor(Number(u.searchParams.get("end")));
+    if (!STREAM_SYMBOLS.includes(symbol) || !Number.isFinite(start) || !Number.isFinite(end) || end <= start || end - start > HISTORY_MAX_WINDOW_S || end > Date.now() / 1000 + 5) {
+      res.statusCode = 400; return res.end(JSON.stringify({ error: "INVALID_PARAMS" }));
+    }
+    if (historyBusy) { res.statusCode = 429; return res.end(JSON.stringify({ error: "HISTORY_BUSY" })); }
+    historyBusy = true;
+    try { return res.end(JSON.stringify({ symbol, source: "DERIV_TICKS_HISTORY", data_origin: "BACKFILL_AFTER_OUTAGE", ...(await tickHistoryPaged(symbol, start, end)) })); }
+    finally { historyBusy = false; }
+  }
+  if (u.pathname === "/stream/proposals") {
+    if (!authorized(req)) return deny(res);
+    const since = Number(u.searchParams.get("since") || 0) * 1000;
+    return res.end(JSON.stringify({ source: "RAILWAY_PERSISTENT_PROPOSALS_PHASE_B", proposals: stepProp.buffer.filter((p) => Date.parse(p.received_at) >= since) }));
+  }
   if (u.pathname === "/metrics") {
     if (!authorized(req)) return deny(res);
     const nowMin = Math.floor(Date.now() / 60000) - 1, q = (p) => { const a = [...stream.lat].sort((x, y) => x - y); return a.length ? a[Math.floor(p * (a.length - 1))] : null; };
     res.setHeader("content-type", "application/json");
     return res.end(JSON.stringify({ ticks_per_min_last_closed: Object.fromEntries(STREAM_SYMBOLS.map((s) => [s, stream.per_min[s + ":" + nowMin] || 0])),
       connection_uptime_s: stream.connected_since ? Math.round((Date.now() - Date.parse(stream.connected_since)) / 1000) : 0, reconnects: stream.reconnects,
-      rate_limit_429: stream.rate_limit_429.length, duplicates: stream.duplicates, p50_processing_ms: q(0.5), p95_processing_ms: q(0.95) }));
+      proposals: { sent: stepProp.sent, ok: stepProp.ok, failed: stepProp.failed, rate_limited: stepProp.rate_limited, timeouts: stepProp.timeouts || 0, pending: Object.keys(stepProp.pending).length, cycle_ms: stepProp.cycle_ms, last_cycle_at: stepProp.last_cycle_at, unavailable: stepProp.unavailable },
+      history: historyStats, rate_limit_429: stream.rate_limit_429.length, duplicates: stream.duplicates, p50_processing_ms: q(0.5), p95_processing_ms: q(0.95) }));
   }
   if (u.pathname === "/ticks") {
     if (!authorized(req)) return deny(res);
@@ -588,7 +697,7 @@ http.createServer(async (req, res) => {
   if (u.pathname === "/health" || u.pathname === "/") {
     return res.end(JSON.stringify({
       service: "deriv-probe-isolated",
-      version: 8,
+      version: 11,
       deriv_15m_proposal_feed: feed15(),
       DERIV_3M_CAPABILITY: capability3m,
       DERIV_5M_CAPABILITY: capability5m,
@@ -597,7 +706,7 @@ http.createServer(async (req, res) => {
       ...state,
       uptime_seconds: Math.floor(process.uptime()),
       active_symbols_count: Object.keys(quotes).length,
-      stream: { phase: "A_READ_ONLY", operational_power: "ZERO", status: state.status, connected_since: stream.connected_since, last_ping_at: stream.last_ping_at, last_pong_at: stream.last_pong_at,
+      stream: { phase: "B_READ_ONLY", operational_power: "ZERO", status: state.status, connected_since: stream.connected_since, last_ping_at: stream.last_ping_at, last_pong_at: stream.last_pong_at,
         ping_rtt_ms: stream.ping_rtt_ms, active_subscriptions: stream.subs, last_tick: stream.last_tick, ticks_received: stream.counts, reconnects: stream.reconnects,
         rate_limit_429: stream.rate_limit_429.length, rate_limit_events: stream.rate_limit_429.slice(-10), duplicates: stream.duplicates, last_error: stream.last_error },
       quotes,
